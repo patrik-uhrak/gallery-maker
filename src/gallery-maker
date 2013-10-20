@@ -1,0 +1,810 @@
+#! /bin/bash
+#################################################################################
+#
+# Author: Patrik Uhrak
+# Email: projectsdevel@gmail.com
+# Licence : GPLv3 http://www.opensource.org/licenses/gpl-3.0.html
+# version : 0.1_08072011
+# Description: Creates nice and simple galleries from video files.
+#
+#################################################################################
+
+
+
+#################################################################################
+#
+#				READONLY VARIABLES
+#
+#################################################################################
+
+
+# version : the version of this script
+# config_version : the version of the configuration file
+# The value of these two variables below don't have to be necessary the same !
+# Both of the following variables keep the following format: version_[day_of_month][month][4-digit year]
+readonly version='0.1_08072011'
+readonly config_version='0.1_08072011'
+
+### DECLARE VARIABLE FOR THE EXIT STATUS OR AS THE RETURN VALUE OF THE FUNCTION
+#
+# e_npcg : If it is not possible to create a gallery; i.e.: no path set, path doesn't include any video files etc.
+# e_root : If user tries to run this script as root.
+# e_home : If it is not possible to create files or directories for configuration and log files.
+# e_gnr_wrong_arg : In case of unknown parameter or missing value if it is needed.
+# e_gnr_x : If the value for the number of screenshots on x axis is not correct; parameter -x
+# e_gnr_y : If the value for the number of screenshots on y axis is not correct; parameter -y
+# e_gnr_s : If the value in seconds for the first screenshot is not correct; parameter -s
+# e_gnr_r : If the value of the resolution is not correct or its format differ to the expected one; parameter -r
+# e_gnr_n : If the value of the name of a movie printed in header of gallery is not correct. IT NEVER OCCUR YET !
+# e_gnr_z : If the value of the deep of the recursive search used by find is not correct; parameter -z
+# e_apps : Missing application needed to run this script correctly.
+# e_terminated : If it is interrupted by a specific signal while the script is running.
+#
+readonly e_npcg=1
+readonly e_root=3
+readonly e_home=4
+readonly e_gnr_wrong_arg=5
+readonly e_gnr_x=6
+readonly e_gnr_y=7
+# readonly e_gnr_s=8	# not needed anymore due to declaring variable start as integer
+readonly e_gnr_r=9
+# readonly e_gnr_n=10	# uncomment, if needed
+readonly e_gnr_z=11
+readonly e_apps=127
+readonly e_terminated=130
+
+### DECLARE VARIABLES WHICH ARE USED FOR THE SCRIPT ITSELF
+#
+readonly date="$(date +%H-%M-%S_%d-%m-%Y)"
+readonly script_home="${HOME}/.gallery_maker"
+readonly config_file="${script_home}/config.cfg"
+readonly log_dir="${script_home}/log"
+readonly log_error_file="${log_dir}/err_log.file"
+readonly log_status_file="${log_dir}/stat_log.file"
+readonly try_to_load_file="${log_dir}/try_to_load_${date}.file"
+
+### DECLARE BACKUP VARIABLES AND SET THEIR VALUE
+# These variables are used as default ones unless they are specified by user (i.e. configuration file, parameters)
+#
+readonly def_width_number_screenshots=6
+readonly def_height_number_screenshots=4
+readonly def_gallery_resolution='1440x900'
+readonly def_show_gallery='false'
+# been superseded by the variable def_cmd_display
+# readonly def_gallery_viewer='display'
+readonly def_start_time=180
+readonly def_font='DejaVu-Sans-Mono-Book'
+
+### DECLARE DEFAULT COMMANDS
+# These commands must be always installed on the system
+# The format for naming variables (aliases) of default commands is following:
+# lowercase name starting with def_cmd_application
+readonly def_cmd_mplayer='mplayer'
+readonly def_cmd_file='file'
+readonly def_cmd_find='find'
+readonly def_cmd_convert='convert'
+readonly def_cmd_mogrify='mogrify'
+readonly def_cmd_identify='identify'
+readonly def_cmd_display='display'
+
+
+#################################################################################
+#
+#				GLOBAL VARIABLES
+#
+#################################################################################
+
+
+### RESERVE SOME GLOBAL NAMES OF VARIABLES
+declare -i width_number_screenshots height_number_screenshots start_time movie_length max_depth_recursive
+declare movie movie_resolution
+
+# List of files to be checked if any of them are also a video file
+declare -a array_files
+# List of video files
+declare -a array_movies
+# Index of array array_movies
+#declare -i index_array_movies=1
+
+
+#################################################################################
+#
+#				            VERIFYING FUNCTIONS
+#
+#################################################################################
+
+
+## Following function verifies the user trying to run this script.	# Hotovo
+#
+VerifyUser()
+{
+if [[ ${EUID} -eq 0 ]]
+then
+	printf "This script can NOT be run as root!\n"
+	exit "${e_root}"
+else
+	# Only user running this script is allowed to read, write or execute his own files.
+	# It should keep user in safe during sourcing config files and so on.
+	# Gallery as a file have granted read and write permissions for user and read permissions for group and others.
+    # See function PutEmTogether()
+	umask 066
+	# If the script is terminated, it will try to remove all junk created during its run
+	# before it will exit.
+	# See function CleanUp for more details.
+	trap 'CleanUp "${temp_directory_path}" "${try_to_load_file}"' SIGHUP SIGINT SIGTERM
+fi
+}
+
+
+# Following function verifies if needed applications are installed already.		# Hotovo
+#
+VerifyApplications()
+{
+declare -i status
+declare cmd_msg
+cmd_msg='echo It is necessary to install the following appllication: '
+
+which "$def_cmd_mplayer" &>/dev/null || (status=1 && "$cmd_msg" "$def_cmd_mplayer")
+# convert, identify, mogrify and so on, they all comes with imagemagick package.
+# Good thing is that we don't have to check each one and the bad thing is, it would be a bit confusing to
+# do the following: $cmd_msg $def_cmd_convert, which will print convert instead of imagemagick.
+# The other thing is, we can possibly use mplayer2 instead of mplayer, but I do not think we can use anything
+# that great and useful as imagemagick itself. So the goal has been reached even not the best way.
+which "$def_cmd_convert" &>/dev/null || (status=1 && "$cmd_msg" imagemagick)
+which "$def_cmd_file" &>/dev/null    || (status=1 && "$cmd_msg" "$def_cmd_file")
+
+# If one or more applications were not found than STATUS must have a value of non-zero length and
+# it causes immediate exit due to the unsatisfied dependencies.
+[[ ${status} ]] && exit "${e_apps}"
+}
+
+
+# Following function verifies if directories exist and moreover read and write permissions	# Hotovo
+# are granted.
+#
+CheckScriptDir()
+{
+local dir
+
+# If log_dir have been already created then nothing happens.
+mkdir -p "${log_dir}" &>/dev/null
+
+# These values are declared in the READONLY VARIABLES section above.
+# script_home="${HOME}/.gallery_maker"
+# log_dir="${script_home}/log"
+for dir in {"${script_home}","${log_dir}"}
+do
+	if [[ ! -d "${dir}" || ! -w "${dir}" ]]
+	then
+		printf "Check permissions for %s and also if it is a directory.
+			\rRead and write permissions must be granted for you!\n" "${dir}"
+		exit "${e_home}"
+	fi
+done
+}
+
+
+# Following function verifies if configuration and log files exist and moreover read and write permissions	# Hotovo
+# are granted.
+#
+CheckScriptFile()
+{
+declare file logs_delimiter
+
+# Delimiter for events in $log_status_file, $LOG_ERROR_FILE for every each run.
+printf -v logs_delimiter "############################################################
+			\r%s
+			\r############################################################\n" "${date}"
+
+# If config_file log_error_file log_status_file have been already created then nothing happens.
+touch "${config_file}" "${log_error_file}" "${log_status_file}" "${try_to_load_file}" &>/dev/null
+
+for file in {"${config_file}","${log_error_file}","${log_status_file}","${try_to_load_file}"}
+do
+	if [[ -f "${file}" && -w "${file}" ]]
+	then
+		# Add the delimiter for each run to log files.
+		printf '%s\n' "${logs_delimiter}" >> "${log_status_file}"
+		printf '%s\n' "${logs_delimiter}" >> "${log_error_file}"
+	else
+		printf "Check permissions for %s and also if it is a file.
+			\rRead and write permissions must be granted for you !\n" "${file}"
+		exit "${e_home}"
+	fi
+done
+}
+
+# Determine how the configuration file look like.
+#
+ConfigTemplate()	# Hotovo
+{
+cat <<_EOF
+# This is configuration file for gallery_maker.bash
+# version of configuration file ${STABLE_CONFIG_VERSION}
+# !!! Do NOT edit the line above !!!
+#######################################################################
+# Uncomment following lines if needed.
+#
+# width_number_screenshots=6	# Default value for the number of screenshots horizontally; must be in range 0..10 including
+# height_number_screenshots=4	# Default value for the number of screenshots vertically; must be in range 0..10 including
+# start_time=180				# Default value for the time of first screenshot
+# gallery_resolution=1440x900	# Default value for the resolution of gallery, must keep format
+# show_gallery='true'		    # Always show gallery
+# gallery_viewer='display'		# Default image viewer
+_EOF
+}
+
+
+# Keeps your configuration file up-to-date.	# Hotovo
+#
+UpdateConfig()
+{
+if ! grep "\<${config_version}\>" "${config_file}" &>/dev/null
+then
+	printf "New version of the configuration file is available !\nYour old configuration file will be saved with suffix .old.timestamp .\nFor update just press any key? : "
+	if read -t 5
+	then
+		mv "${config_file}" "${config_file}.old.${date}"
+		ConfigTemplate >"${config_file}"
+	fi
+fi
+}
+
+
+# This function reads the configuration file.
+#
+ReadConfig()
+{
+if [[ -r ${config_file} ]]
+then
+	source "${config_file}"
+fi
+}
+
+
+# This function checks if the file is a video file.
+#
+VerifyMovie()
+{
+if [[ $("$def_cmd_file" -b --mime "${1}") =~ ^video/.* ]]
+then
+	return 0
+else
+	return 1
+fi
+}
+
+
+# This function verify if $width_number_screenshots is a number and
+# it is in range from 1 to 10.
+#
+VerifyWidthNumberScreenshots()
+{
+# $1 is always a number due to declaring variable width_number_screenshots as integer.
+# If the value for width_number_screenshots was set to a string then the value is also turned to 0.
+if [[ ${1} -gt 10 || ${1} -le 0 ]]
+then
+	printf "Value %d for number of screenshots horizontally must be a number in range from 1 to 10 included !\n" "${1}"
+	printf "For help use: %s -h\n" "${0##*\/}" 1>&2
+	exit "${e_gnr_x}"
+fi
+}
+
+
+# This function verify if $HEIGHT_number_screenshots is a number and
+# it is in range from 1 to 10.
+#
+VerifyHeightNumberScreenshots()
+{
+# $1 is always a number due to declaring variable height_number_screenshots as integer.
+# If the value for height_number_screenshots was set to a string then the value is also turned to 0.
+#
+if [[ ${1} -gt 10 || ${1} -le 0 ]]
+then
+	printf "Value %d for number of screenshots vertically must be a number in range from 1 to 10 included !\n" "${1}"
+	printf "For help use: %s -h\n" "${0##*\/}" 1>&2
+	exit "${e_gnr_y}"
+fi
+}
+
+
+# This function verify the time of the first screenshot.
+#
+VerifyTime0fFirstScreenshot()
+{
+declare old_start
+
+number_screenshots=$((width_number_screenshots * height_number_screenshots))
+
+GetMovieInfo
+printf "################################################################################
+	\rVideo: %s\n" "${movie}"
+
+if [[ $(((2 * start_time) + number_screenshots)) -le ${movie_length} ]]
+then
+	return 0
+# We always try make it possible to create expected number of screenshots, therefore
+# we just don't count start value although it is possible that you will see some useless stuff
+# on those screenshots.
+elif [[ ${number_screenshots} -lt ${movie_length} ]]
+then
+	old_start=${start_time}
+	start=$(((movie_length - number_screenshots) / 2))
+	printf "\rValue for the time of the first screenshot %s seconds is too high.
+		\rAs a replacement will be used the highest possible value of %s seconds.\n" ${old_start} ${start} | tee -a "${log_status_file}" 1>&2
+	return 0
+# If the length of movie in seconds is less than the number of screenshots, than it fails and we write the absolute path to the movie which can be
+# processed later during another run with different values to get it done.
+else
+	printf "Video file: %s\n" "${movie}" >> "${log_error_file}"
+	printf "It is not possible to create %s screenshots.
+		\rGallery can be created with up to %s screenshots.\n" ${number_screenshots} ${movie_length} | tee -a "${log_error_file}" 1>&2
+	printf "%s\n" "${movie}" >> "${try_to_load_file}"
+	return 1
+fi
+}
+
+
+# This function checks whether $MAX_DEPTH_RECURSIVE is a number and higher than 0 (zero) or not.
+#
+VerifyMaxDepthRecursive()
+{
+if (( $1 <= 0 ))
+then
+	printf "Defined value for recursive search must be higher than 0!\n" | tee -a "${log_error_file}" 1>&2
+	printf "For help use: %s -h\n" "${0##*\/}" 1>&2
+	exit "${e_gnr_z}"
+else
+	return 0
+fi
+}
+
+
+# This function checks if the specified resolution is in the correct format.
+#
+VerifyResolutionOfGallery()
+{
+declare error_msg delim
+
+printf -v error_msg 'Format for declaring resolution is not correct!\nFor help use: %s -h' "${0##*\/}"
+
+if [[ ${1} != ${def_gallery_resolution} ]]
+then
+	# Value must contain only one character "x"
+	delim="${1//[^x]}"
+	if [[ ${#delim} -ne 1 ]]
+	then
+		printf '%s\n' "${error_msg}" | tee -a "${log_error_file}" 1>&2
+		exit "${e_gnr_r}"
+	fi
+
+	# Checks left side from the character "x", if it is a number and also higher than 0 (zero).
+	test "${1//x*}" -ge 0 2>/dev/null
+	if [[ $? -ne 0 ]]
+	then
+		printf '%s\n' "${error_msg}" | tee -a "${log_error_file}" 1>&2
+		exit "${e_gnr_r}"
+	fi
+
+	# Checks right side from character "x", if it is a number and also higher than 0 (zero).
+	test "${1//*x}" -ge 0 2>/dev/null
+	if [[ $? -ne 0 ]]; then
+
+		printf '%s\n' "${error_msg}" | tee -a "${log_error_file}" 1>&2
+		exit "${e_gnr_r}"
+	fi
+fi
+}
+
+
+
+#################################################################################
+#
+#				                MAIN FUNCTIONS
+#
+#################################################################################
+
+
+Help()              # Hotovo
+{
+cat <<_EOF
+gallerymaker.bash creates nice and simple galleries from video files.
+Autor: Patrik Uhrak
+Email: projectsdevel[ at ]gmail[ dot ]com
+Verzia: ${version}
+
+Usage:
+    gallerymaker.bash /path/to/video/file [optional parameters]
+
+Parameters:
+	-x; --xaxis : Specifies number of screenshots vertically.
+	-y; --yaxis : Specifies number of screenshots horizontallly.
+	-s; --start : Specifies the time of the first screenshot.
+	-r; --resolution : Specifies resolution of gallery. Correct format is for example 1440x900, 1280x800.
+	-n; --name  : It is just a name printed in header of gallery instead of filename. Nothing else!
+	-z; --depth : Specifies how deep will be searched in each directory specified by user. If it is not specified,
+			but directory is set to be searched in, then will be searched as deep as possible.
+	-l; --list  : Loads try_to_load_XX-XX-XX_XX-XX-XXXX.file and tries to create new gallery with different
+			values of parameters as before.
+	-d; --display : Displays gallery as soon as it is created.
+	-h; --help  : Shows help.
+
+Examples:
+	gallerymaker.bash /path/to/video/file -x 5 -y 5 -s 500 -r 1280x1024 -n 'walking backwards' -d
+	gallerymaker.bash /path/to/dir/with/video/files -x 5 -y 5 -s 500 -r 1280x1024 -z 3
+_EOF
+}
+
+
+CleanUp()                  # Hotovo
+{
+printf "\nScript was unexpectedly interupted !\n" | tee -a "${log_error_file}" 1>&2
+
+if [[ -e ${1} ]]
+then
+	if [[ -s ${2} ]]
+	then
+		rm -rvf "${1}" | tee -a "${log_error_file}" 1>&2
+		printf "#######################################################################
+			\r\t\tTemporary files has been deleted. Bey.
+			\n#######################################################################\n"
+	else
+		rm -rvf "${1}" "${2}" | tee -a "${log_error_file}" 1>&2
+		printf "#######################################################################
+			\r\t\tTemporary files has been deleted. Bey.
+			\n#######################################################################\n"
+	fi
+else
+	printf "#######################################################################
+		\r\t\t\tBey.
+		#######################################################################\n"
+fi
+
+exit ${e_terminated}
+}
+
+
+LoadParameters()       # Hotovo
+{
+declare file
+
+while [[ ${1} ]]
+do
+	case "${1}" in
+
+		-x | --xaxis )
+			width_number_screenshots=${2}
+			shift 2
+		;;
+
+		-y | --yaxis )
+			height_number_screenshots=${2}
+			shift 2
+		;;
+
+		-s | --start )
+			start=${2}
+			shift 2
+		;;
+
+		-r | --resolution )
+			gallery_resolution="$2"
+			shift 2
+		;;
+
+		-n | --name )
+			new_movie_name="$2"
+			shift 2
+		;;
+
+		-d | --display )
+			show_gallery='true'
+			shift
+		;;
+
+		-z | --depth )
+			max_depth_recursive=${2}
+			shift 2
+		;;
+
+		-h | --help )
+			Help
+			exit 0
+		;;
+
+		-l | --list )
+			if file -b --mime "${2}" | grep "^\<text/.*\>" &>/dev/null
+			then
+				for file in $(cat "$2")
+				do
+					array_files=( "${array_files[@]}" "${file}" )
+				done
+			else
+				break
+			fi
+			shift 2
+		;;
+
+		* )
+			file="$(readlink -f "${1}" 2>/dev/null )"
+			if [[ $? -eq 0 && -r "${file}" ]]
+			then
+				array_files=( "${array_files[@]}" "${file}" )
+			else
+				break
+			fi
+			shift
+		;;
+
+	esac
+done
+}
+
+
+AddFile()               # Hotovo
+{
+if VerifyMovie "${1}"
+then
+	array_movies=( "${array_movies[@]}" "${1}" )
+fi
+}
+
+
+SearchInDirectory()     # Hotovo
+{
+declare line wannabe_movie
+
+VerifyMaxDepthRecursive ${max_depth_recursive}
+
+while read wannabe_movie
+do
+	if 	VerifyMovie "${wannabe_movie}"
+	then
+		array_movies=( "${array_movies[@]}" "${wannabe_movie}" )
+	fi
+done< <( if [[ -z ${max_depth_recursive} ]]
+		then
+			find "${1}" -type f -name "*" 2>/dev/null
+		else
+			find "${1}" -maxdepth ${max_depth_recursive} -type f -name "*" 2>/dev/null
+		fi )
+}
+
+
+LoadMovies()         # Hotovo
+{
+local file
+
+if [[ ${#array_files[@]} -ne 0 ]]
+then
+	for file in "${array_files[@]}"
+	do
+		if [[ -d ${file} ]]
+		then
+			SearchInDirectory "${file}"
+		elif [[ -f ${file} ]]
+		then
+			AddFile "${file}"
+		fi
+	done
+else
+	printf "It is needed to set any path, where I can try to find files!\n" | tee -a "${log_error_file}" 1>&2
+	printf "For help use: %s -h\n" "${0##*\/}"
+	exit ${e_npcg}
+fi
+if [[ ${#array_movies[@]} -eq 0 ]]
+then
+	printf "I did not find any files. It could be caused even due to defined value for recursive search!\n" | tee -a "${log_error_file}" 1>&2
+	printf "For help use: %s -h\n" "${0##*\/}"
+	exit ${e_npcg}
+fi
+}
+
+
+GetMovieInfo()         # Hotovo
+{
+local line
+declare -i movie_width movie_height
+
+while read line
+do
+    # This test always receives the value in format: ID_LENGTH=1111.22 . Thus first of all I cut off decimal numbers
+    # by calling BASH_REMATCH[0], which returns only what the previous regexp matched.
+    # Maybe not the best way ... but nobody has said a better one. :)
+	if [[ ${line} =~ ^ID_LENGTH\=[0-9]* ]]
+	then
+		movie_length=${BASH_REMATCH[0]//*=}
+	elif [[ ${line} =~ ^ID_VIDEO_WIDTH ]]
+	then
+		movie_width=${line//*=}
+	elif [[ ${line} =~ ^ID_VIDEO_HEIGHT ]]
+	then
+		movie_height=${line//*=}
+	fi
+done< <("$def_cmd_mplayer" -noconfig all -vo null -ao null -identify -frames 0 "${movie}" 2>/dev/null)
+
+movie_resolution=${movie_width}x${movie_height}
+movie_path="${movie%/*}"
+END_TIME=${start_time}
+
+# Yet it is possible to set different name to the header of a gallery only for one/first video in stack.
+# Will try to improve this as soon as I find out how to do that.
+# The variable new_movie_name is the main part of the gallery filename.
+if [[ -z ${new_movie_name} ]]
+then
+    # If it is not set by user, then we can take the filename without its suffix.
+	new_movie_name="$(expr match "${movie}" '.*/\(.*\)\.')"
+fi
+}
+
+
+MovieLengthHMS()    # Hotovo
+{
+declare -i hours minutes seconds
+hours=$((movie_length / 3600))
+minutes=$((movie_length % 3600 / 60))
+seconds=$((movie_length % 60))
+time=$(printf '%02d:%02d:%02d' ${hours} ${minutes} ${seconds})
+}
+
+
+MakeScreenshots()          # Hotovo
+{
+declare screenshot
+declare -i range_time height width step_time
+
+range_time=$((movie_length - (2 * start)))
+width=$(( ${gallery_resolution//x*} / ${width_number_screenshots} ))
+# In case that the height is lower than the width, which is a classic living room TV aspect ratio
+height=${width}
+step_time=$((range_time / number_screenshots))
+
+printf 'I am just taking screenshots ... Can take a while.'
+$def_cmd_mplayer -noconfig all -really-quiet -ao null -vo png -ss ${start_time} -sstep ${step_time} \
+        -frames ${number_screenshots} -vo png:z=0 "${movie}" 2>/dev/null
+
+#for screenshot in *.png
+#do
+#    # It is possible to make up to 100 screenshots with this script, thus "${screenshot##*000}" removes all
+#    # zeros from the beginning of the filename according how $cmd_mplayer itself names screenshots (%08d.suffix).
+#    # Hopefully I shall be able to change this as I do not think that this is the best way so far and might lead to
+#    # some
+#    # difficulties in the future. Actually very easily. :(
+#    convert "${screenshot}" -resize ${width}x${height} -bordercolor white -border 3x3 "${screenshot##*000}"
+#done
+$def_cmd_mogrify -resize ${width}x${height} -bordercolor white -border 3x3 *.png
+}
+
+
+PutEmTogether()
+{
+declare info_msg aspect_ratio test_screenshot aspect_ratio
+declare -i start_index end_index
+declare -a array_screenshots
+
+# 0_down.png is always created, if we have come here.
+test_screenshot='0_down.png'
+# Due to the indexing of arrays, which starts at 0 (i.e. first element is with index 0; second element is with index 1; ..)
+end_index=$(( ${width_number_screenshots} - 1 ))
+# There should NOT be any other files with png extension for the few following reasons:
+# 1. Script creates temporary directory under /tmp.
+# 2. Script always empty temporary directory after each video file.
+# So unless somebody wants to break it, it should work. Or not ? Let me know. Thanks.
+array_screenshots=( *.png )
+
+printf -v info_msg 'Title: %s\nLength: %s\nResolution: %s' "${new_movie_name}" "${time}" "${movie_resolution}"
+printf '\nI am just creating gallery... Can take a while'
+
+for (( start_index=0; start_index<${number_screenshots}; start_index=$(( start_index + end_index )) ))
+do
+    $def_cmd_convert "${array_screenshots[@]:${start_index}:${end_index}}" +append ${start_index}_down.png
+done
+
+printf '\nNow I am finishing. Please wait a moment ...\n'
+$def_cmd_convert *_down.png -append body.png
+aspect_ratio=$($def_cmd_identify -format %wx%h "${test_screenshot}")
+
+# So far, not the best idea but at the moment only one how to make the header smaller. Most of the resolutions of videos
+# can cover the following code, but not all of them. Needs to be improved and it wont be that easy ...
+if [[ "${aspect_ratio//x*}" -ge "${aspect_ratio//*x}" ]]
+then
+    $def_cmd_convert -size x$(( ${aspect_ratio//*x} / 2 )) -font "${font}" label:"${info_msg}" header.png
+else
+    $def_cmd_convert -size $(( ${aspect_ratio//x*} / 2 ))x -font "${font}" label:"${info_msg}" header.png
+fi
+
+$def_cmd_convert header.png body.png -append -resize ${gallery_resolution} -bordercolor white \
+        -border 5x5 gallery_"${new_movie_name}".png
+# All files created by this script has read and write permissions granted for owner and no rigths for group and others
+# except the gallery itself. See function VerifyUser, where umask is set.
+# In the future i would like to follow user settings of the user who is running this script (~/.profile settings or so)
+chmod 644 gallery_"${new_movie_name}".png
+}
+
+
+ProceedMovie()
+{
+VerifyWidthNumberScreenshots ${width_number_screenshots}
+VerifyHeightNumberScreenshots ${height_number_screenshots}
+VerifyResolutionOfGallery ${gallery_resolution}
+if VerifyTime0fFirstScreenshot
+then
+	MovieLengthHMS
+	MakeScreenshots
+	PutEmTogether
+	return 0
+else
+	return 1
+fi
+}
+
+
+DisplayGalleryOrNot()
+{
+if [[ ${1} == "${def_show_gallery}" ]]
+then
+	printf "Video file: %s\n" "${movie}" >> "${log_status_file}"
+	printf "Gallery is saved in %s\n" "${movie_path}" | tee -a "${log_status_file}"
+else
+	"$def_cmd_display" "${movie_path}"/"gallery_${movie##*/}.png"
+	printf "Video file: %s\n" "${movie}" >> "${log_status_file}"
+	printf "Gallery is saved in %s\n" "${movie_path}" | tee -a "${log_status_file}"
+fi
+}
+
+
+GetRidOfAllJunk()
+{
+# If $TRY_TO_LOAD_FILE is empty, it will be deleted.
+if [[ ! -s ${try_to_load_file} ]]
+then
+	rm "${try_to_load_file}"
+fi
+rm -r "${temp_directory_path}"
+}
+
+
+#################################################################################
+#
+#				                    MAIN SCRIPT
+#
+#################################################################################
+
+
+VerifyUser
+VerifyApplications
+CheckScriptDir
+CheckScriptFile
+UpdateConfig
+ReadConfig
+LoadParameters "$@"
+LoadMovies
+readonly temp_directory_path="$(mktemp -d /tmp/gallery_maker_XXXXXXXXXX )"
+cd "${temp_directory_path}"
+
+# Load default values of variables, if they was not specified by user or configuration file.
+width_number_screenshots=${width_number_screenshots:-${def_width_number_screenshots}}
+height_number_screenshots=${height_number_screenshots:-${def_height_number_screenshots}}
+start_time=${start_time:-${def_start_time}}
+gallery_resolution=${gallery_resolution:-${def_gallery_resolution}}
+font="${font:-${def_font}}"
+show_gallery=${show_gallery:-${def_show_gallery}}
+# gallery_viewer="${gallery_viewer:-"$def_cmd_display"}"
+
+for movie in "${array_movies[@]}"
+do
+	if ProceedMovie
+	then
+		mv "gallery_${movie##*/}.png" "${movie_path}"
+		rm "${temp_directory_path}"/*
+		DisplayGalleryOrNot ${show_gallery}
+		let index_array_movies++
+		unset new_movie_name
+	else
+		let index_array_movies++
+		unset new_movie_name
+	fi
+done
+
+#
+GetRidOfAllJunk
